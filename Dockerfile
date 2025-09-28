@@ -29,4 +29,6 @@ RUN mkdir -p static/images
 EXPOSE 8000
 
 # Command to run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
+# Use 1 worker and extend timeout to allow heavy TensorFlow model loading
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 app:app
+
