@@ -26,7 +26,7 @@ COPY . .
 RUN mkdir -p static/images
 
 # Expose the port the app runs on
-EXPOSE 8080
+EXPOSE 8000
 
 # Command to run the application
-CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 2 app:app
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
