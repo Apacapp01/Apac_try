@@ -29,4 +29,4 @@ RUN mkdir -p static/images
 EXPOSE 8080
 
 # Command to run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 2 app:app
