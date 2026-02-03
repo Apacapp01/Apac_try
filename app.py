@@ -97,7 +97,7 @@ def extract_keypoints(image_np):
 # ---------------- ROUTES ----------------
 @app.route("/")
 def index():
-    return "Render backend running 🚀"
+    return render_template("index.html")
 
 @app.route("/upload_image", methods=["POST"])
 def upload_image():
@@ -159,3 +159,4 @@ def process_frame():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
