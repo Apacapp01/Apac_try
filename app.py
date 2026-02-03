@@ -6,7 +6,7 @@ import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from PIL import Image
@@ -159,4 +159,5 @@ def process_frame():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
