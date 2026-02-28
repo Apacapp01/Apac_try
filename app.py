@@ -24,12 +24,12 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 
 # ---------------- GLOBAL CACHE ----------------
-models = {}       # lazy-loaded TFLite interpreters
+models = {}
 scaler = None
 labels = None
 hands = None
 
-# ---------------- LAZY LOAD COMMON RESOURCES ----------------
+# ---------------- LOAD COMMON RESOURCES ----------------
 def load_common_resources():
     global scaler, labels, hands
 
@@ -48,7 +48,7 @@ def load_common_resources():
             min_detection_confidence=0.5
         )
 
-# ---------------- LOAD TFLITE MODEL ----------------
+# ---------------- LOAD MODEL ----------------
 def load_model(model_type):
     if model_type in models:
         return models[model_type]
@@ -56,13 +56,17 @@ def load_model(model_type):
     model_paths = {
         "live": "models/final_model.tflite",
         "letter": "models/L_model.tflite",
-        "number": "models/N_model.tflite"
+        "number": "models/N_model.tflite",
+        "word": "models/W_model.tflite"
     }
+
+    if model_type not in model_paths:
+        raise ValueError("Invalid model type")
 
     interpreter = tflite.Interpreter(model_path=model_paths[model_type])
     interpreter.allocate_tensors()
-
     models[model_type] = interpreter
+
     return interpreter
 
 # ---------------- UTILS ----------------
@@ -73,18 +77,26 @@ def extract_keypoints(image_np):
     image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
     results = hands.process(image_rgb)
 
+    if not results.multi_hand_landmarks:
+        return None
+
     keypoints = np.zeros(126, dtype=np.float32)
+    idx = 0
 
-    if results.multi_hand_landmarks:
-        idx = 0
-        for hand in results.multi_hand_landmarks:
-            for lm in hand.landmark:
-                if idx >= 126:
-                    break
-                keypoints[idx:idx+3] = (lm.x, lm.y, lm.z)
-                idx += 3
+    for hand in results.multi_hand_landmarks:
+        for lm in hand.landmark:
+            if idx >= 126:
+                break
+            keypoints[idx:idx+3] = (lm.x, lm.y, lm.z)
+            idx += 3
 
-    return scaler.transform(keypoints.reshape(1, -1)).astype(np.float32)
+    keypoints = scaler.transform(keypoints.reshape(1, -1)).astype(np.float32)
+    return keypoints
+
+def preprocess_image_for_cnn(image_np):
+    image_resized = cv2.resize(image_np, (224, 224))
+    image_resized = image_resized.astype(np.float32) / 255.0
+    return np.expand_dims(image_resized, axis=0)
 
 def predict_tflite(interpreter, input_data):
     input_details = interpreter.get_input_details()
@@ -93,8 +105,7 @@ def predict_tflite(interpreter, input_data):
     interpreter.set_tensor(input_details[0]["index"], input_data)
     interpreter.invoke()
 
-    output = interpreter.get_tensor(output_details[0]["index"])
-    return output
+    return interpreter.get_tensor(output_details[0]["index"])
 
 # ---------------- ROUTES ----------------
 @app.route("/")
@@ -119,10 +130,23 @@ def upload_image():
         img = Image.open(path).convert("RGB")
         img_np = np.array(img)
 
-        keypoints = extract_keypoints(img_np)
         interpreter = load_model(model_type)
+        input_shape = interpreter.get_input_details()[0]["shape"]
 
-        pred = predict_tflite(interpreter, keypoints)
+        # KEYPOINT MODEL
+        if input_shape[-1] == 126:
+            keypoints = extract_keypoints(img_np)
+
+            if keypoints is None:
+                return jsonify({"has_hands": False})
+
+            input_data = keypoints
+
+        # IMAGE MODEL
+        else:
+            input_data = preprocess_image_for_cnn(img_np)
+
+        pred = predict_tflite(interpreter, input_data)
         label = labels[int(np.argmax(pred))]
 
         return jsonify({
@@ -134,12 +158,14 @@ def upload_image():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/process_frame", methods=["POST"])
 def process_frame():
     load_common_resources()
-    interpreter = load_model("live")
 
     try:
+        interpreter = load_model("live")
+
         data = request.json["image"].split(",")[1]
         frame = cv2.imdecode(
             np.frombuffer(base64.b64decode(data), np.uint8),
@@ -147,6 +173,10 @@ def process_frame():
         )
 
         keypoints = extract_keypoints(frame)
+
+        if keypoints is None:
+            return jsonify({"has_hands": False})
+
         pred = predict_tflite(interpreter, keypoints)
 
         return jsonify({
@@ -156,6 +186,7 @@ def process_frame():
 
     except Exception:
         return jsonify({"has_hands": False})
+
 
 # ---------------- START ----------------
 if __name__ == "__main__":
