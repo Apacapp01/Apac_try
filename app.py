@@ -1,194 +1,207 @@
 import os
-import cv2
 import base64
+import time
 import pickle
+import cv2
 import numpy as np
 import mediapipe as mp
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 from PIL import Image
+from werkzeug.utils import secure_filename
+from tensorflow.keras.models import load_model
+from functools import lru_cache
 
 # ---------------- APP SETUP ----------------
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = "static/images"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# ---------------- CONFIG ----------------
+app.config['UPLOAD_FOLDER'] = 'static/images'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg'}
 
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+# ---------------- MEDIAPIPE ----------------
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
 
-# ---------------- GLOBAL CACHE ----------------
-models = {}
-scaler = None
-labels = None
-hands = None
+# ---------------- TENSORFLOW SETTINGS ----------------
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+tf.config.threading.set_intra_op_parallelism_threads(2)
+tf.config.threading.set_inter_op_parallelism_threads(2)
 
-# ---------------- LOAD COMMON RESOURCES ----------------
-def load_common_resources():
-    global scaler, labels, hands
+# ---------------- LABELS ----------------
+letter_labels = {i: chr(65 + i) for i in range(26)}
+number_labels = {i: str(i) for i in range(10)}
 
-    if scaler is None:
-        with open("models/scaler.pkl", "rb") as f:
-            scaler = pickle.load(f)
+class_labels = {
+    0: 'are', 1: 'did', 2: 'doing', 3: 'eat',
+    4: 'going', 5: 'How', 6: 'is', 7: 'name',
+    8: 'What', 9: 'Where', 10: 'Which', 11: 'you', 12: 'your'
+}
 
-    if labels is None:
-        with open("models/sign_language_features.pkl", "rb") as f:
-            labels = pickle.load(f)["labels"]
+# ---------------- MODEL LOADING ----------------
+@lru_cache(maxsize=1)
+def load_models_and_scaler():
 
-    if hands is None:
-        hands = mp.solutions.hands.Hands(
-            static_image_mode=True,
-            max_num_hands=2,
-            min_detection_confidence=0.5
-        )
-
-# ---------------- LOAD MODEL ----------------
-def load_model(model_type):
-    if model_type in models:
-        return models[model_type]
-
-    model_paths = {
-        "live": "models/final_model.tflite",
-        "letter": "models/L_model.tflite",
-        "number": "models/N_model.tflite",
-        "word": "models/W_model.tflite"
+    models = {
+        'live_model': load_model('models/final_model.keras', compile=False),
+        'letter_model': load_model('models/L_model.h5', compile=False),
+        'number_model': load_model('models/N_model.h5', compile=False),
+        'word_model': load_model('models/W_model.h5', compile=False)
     }
 
-    if model_type not in model_paths:
-        raise ValueError("Invalid model type")
+    with open('models/sign_language_features.pkl', 'rb') as f:
+        data = pickle.load(f)
+        labels = data['labels']
 
-    interpreter = tflite.Interpreter(model_path=model_paths[model_type])
-    interpreter.allocate_tensors()
-    models[model_type] = interpreter
+    with open('models/scaler.pkl', 'rb') as file:
+        scaler = pickle.load(file)
 
-    return interpreter
+    return models, labels, scaler
+
+
+models, labels, scaler = load_models_and_scaler()
 
 # ---------------- UTILS ----------------
 def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-def extract_keypoints(image_np):
-    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-    results = hands.process(image_rgb)
 
-    if not results.multi_hand_landmarks:
-        return None
+def preprocess_image(image, target_size=(224, 224)):
 
-    keypoints = np.zeros(126, dtype=np.float32)
-    idx = 0
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
 
-    for hand in results.multi_hand_landmarks:
-        for lm in hand.landmark:
-            if idx >= 126:
-                break
-            keypoints[idx:idx+3] = (lm.x, lm.y, lm.z)
-            idx += 3
+    img_array = np.array(image.resize(target_size))
 
-    keypoints = scaler.transform(keypoints.reshape(1, -1)).astype(np.float32)
-    return keypoints
+    if len(img_array.shape) == 2:
+        img_array = np.stack((img_array,) * 3, axis=-1)
+    elif img_array.shape[2] == 4:
+        img_array = img_array[:, :, :3]
 
-def preprocess_image_for_cnn(image_np):
-    image_resized = cv2.resize(image_np, (224, 224))
-    image_resized = image_resized.astype(np.float32) / 255.0
-    return np.expand_dims(image_resized, axis=0)
+    return img_array.astype(np.float32) / 255.0
 
-def predict_tflite(interpreter, input_data):
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
 
-    interpreter.set_tensor(input_details[0]["index"], input_data)
-    interpreter.invoke()
+def extract_keypoints_two_hands(image_np):
 
-    return interpreter.get_tensor(output_details[0]["index"])
+    with mp_hands.Hands(
+        static_image_mode=True,
+        max_num_hands=2,
+        min_detection_confidence=0.5
+    ) as hands:
+
+        results = hands.process(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB))
+
+        keypoints = np.zeros(126, dtype=np.float32)
+
+        if results.multi_hand_landmarks:
+
+            idx = 0
+
+            for hand in results.multi_hand_landmarks:
+
+                for lm in hand.landmark:
+
+                    if idx >= 126:
+                        break
+
+                    keypoints[idx] = lm.x
+                    keypoints[idx+1] = lm.y
+                    keypoints[idx+2] = lm.z
+                    idx += 3
+
+        return keypoints.reshape(1, 126)
+
 
 # ---------------- ROUTES ----------------
-@app.route("/")
+@app.route('/')
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-@app.route("/upload_image", methods=["POST"])
+
+@app.route('/upload_image', methods=['POST'])
 def upload_image():
-    load_common_resources()
 
-    file = request.files.get("file")
-    model_type = request.form.get("type", "live")
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
 
-    if not file or not allowed_file(file.filename):
-        return jsonify({"error": "Invalid file"}), 400
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type'}), 400
 
     filename = secure_filename(file.filename)
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(path)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    file.save(filepath)
 
     try:
-        img = Image.open(path).convert("RGB")
-        img_np = np.array(img)
 
-        interpreter = load_model(model_type)
-        input_shape = interpreter.get_input_details()[0]["shape"]
+        img = Image.open(filepath)
+        img_array = preprocess_image(img)
 
-        # KEYPOINT MODEL
-        if input_shape[-1] == 126:
-            keypoints = extract_keypoints(img_np)
+        pred_letter = models['letter_model'].predict(np.expand_dims(img_array, 0), verbose=0)
+        pred_number = models['number_model'].predict(np.expand_dims(img_array, 0), verbose=0)
 
-            if keypoints is None:
-                return jsonify({"has_hands": False})
+        conf_letter = float(np.max(pred_letter))
+        conf_number = float(np.max(pred_number))
 
-            input_data = keypoints
-
-        # IMAGE MODEL
+        if conf_letter >= conf_number:
+            prediction = letter_labels[np.argmax(pred_letter)]
         else:
-            input_data = preprocess_image_for_cnn(img_np)
-
-        pred = predict_tflite(interpreter, input_data)
-        label = labels[int(np.argmax(pred))]
+            prediction = number_labels[np.argmax(pred_number)]
 
         return jsonify({
             "success": True,
-            "model": model_type,
-            "prediction": label
+            "prediction": prediction,
+            "confidence": max(conf_letter, conf_number)
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/process_frame", methods=["POST"])
+@app.route('/process_frame', methods=['POST'])
 def process_frame():
-    load_common_resources()
 
-    try:
-        interpreter = load_model("live")
+    data = request.get_json()
 
-        data = request.json["image"].split(",")[1]
-        frame = cv2.imdecode(
-            np.frombuffer(base64.b64decode(data), np.uint8),
-            cv2.IMREAD_COLOR
-        )
+    if not data or 'image' not in data:
+        return jsonify({"error": "No image provided"}), 400
 
-        keypoints = extract_keypoints(frame)
+    image_data = data['image'].split(',')[1]
+    nparr = np.frombuffer(base64.b64decode(image_data), np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if keypoints is None:
-            return jsonify({"has_hands": False})
+    keypoints_array = extract_keypoints_two_hands(frame)
 
-        pred = predict_tflite(interpreter, keypoints)
+    keypoints_flat = keypoints_array.reshape(1, -1)
+    keypoints_scaled = scaler.transform(keypoints_flat)
 
-        return jsonify({
-            "has_hands": True,
-            "prediction": labels[int(np.argmax(pred))]
-        })
+    prediction = models['live_model'].predict(keypoints_scaled, verbose=0)
+    predicted_label = labels[np.argmax(prediction)]
 
-    except Exception:
-        return jsonify({"has_hands": False})
+    return jsonify({
+        "success": True,
+        "prediction": predicted_label
+    })
 
 
-# ---------------- START ----------------
+# ---------------- START SERVER ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(os.environ.get("PORT", 7860))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
